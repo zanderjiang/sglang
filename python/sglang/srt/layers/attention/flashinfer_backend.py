@@ -542,6 +542,86 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+        
+        my_q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        my_kv = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        
+        print(f"ALEXANDER Q_SHAPE: {my_q.shape}", flush=True)
+        print(f"ALEXANDER Q_DTYPE: {my_q.dtype}", flush=True)
+        print(f"ALEXANDER K_CACHE_SHAPE: {my_kv[0].shape}", flush=True)
+        print(f"ALEXANDER V_CACHE_SHAPE: {my_kv[1].shape}", flush=True)
+        print(f"ALEXANDER K_DTYPE: {my_kv[0].dtype}", flush=True)
+        print(f"ALEXANDER V_DTYPE: {my_kv[1].dtype}", flush=True)
+        print(f"ALEXANDER BATCH_SIZE: {my_q.shape[0]}", flush=True)
+        print(f"ALEXANDER NUM_Q_HEADS: {layer.tp_q_head_num}", flush=True)
+        print(f"ALEXANDER NUM_KV_HEADS: {layer.tp_k_head_num}", flush=True)
+        print(f"ALEXANDER HEAD_DIM: {layer.head_dim}", flush=True)
+        print(f"ALEXANDER SM_SCALE: {layer.scaling}", flush=True)
+        print(f"ALEXANDER K_SCALE: {layer.k_scale}", flush=True)
+        print(f"ALEXANDER V_SCALE: {layer.v_scale}", flush=True)
+        print(f"ALEXANDER LOGITS_SOFT_CAP: {layer.logit_cap}", flush=True)
+        
+        # ALL NEW
+        # PAGED ATTENTION METADATA - This is crucial for decode kernel!
+        print("ALEXANDER PAGED ATTENTION METADATA:", flush=True)
+        print(f"ALEXANDER PAGE_SIZE: {forward_batch.token_to_kv_pool.page_size}", flush=True)
+        
+        # Access the wrapper's internal buffers
+        if hasattr(decode_wrapper, '_paged_kv_indptr_buf') and decode_wrapper._paged_kv_indptr_buf is not None:
+            kv_indptr = decode_wrapper._paged_kv_indptr_buf
+            print(f"ALEXANDER KV_INDPTR_SHAPE: {kv_indptr.shape}", flush=True)
+            print(f"ALEXANDER KV_INDPTR_DTYPE: {kv_indptr.dtype}", flush=True)
+            # Show first few values to understand the paging structure
+            indptr_vals = kv_indptr[:min(10, len(kv_indptr))].tolist()
+            print(f"ALEXANDER KV_INDPTR_VALUES: {indptr_vals}", flush=True)
+        
+        if hasattr(decode_wrapper, '_paged_kv_indices_buf') and decode_wrapper._paged_kv_indices_buf is not None:
+            kv_indices = decode_wrapper._paged_kv_indices_buf
+            print(f"ALEXANDER KV_INDICES_SHAPE: {kv_indices.shape}", flush=True)
+            print(f"ALEXANDER KV_INDICES_DTYPE: {kv_indices.dtype}", flush=True)
+            # Show first few values
+            indices_vals = kv_indices[:min(20, len(kv_indices))].tolist()
+            print(f"ALEXANDER KV_INDICES_VALUES: {indices_vals}", flush=True)
+        
+        if hasattr(decode_wrapper, '_paged_kv_last_page_len_buf') and decode_wrapper._paged_kv_last_page_len_buf is not None:
+            kv_last_page_len = decode_wrapper._paged_kv_last_page_len_buf
+            print(f"ALEXANDER KV_LAST_PAGE_LEN_SHAPE: {kv_last_page_len.shape}", flush=True)
+            print(f"ALEXANDER KV_LAST_PAGE_LEN_DTYPE: {kv_last_page_len.dtype}", flush=True)
+            # Show values for current batch
+            last_page_vals = kv_last_page_len[:my_q.shape[0]].tolist()
+            print(f"ALEXANDER KV_LAST_PAGE_LEN_VALUES: {last_page_vals}", flush=True)
+        
+        # Show sequence lengths and other forward batch info
+        print(f"ALEXANDER SEQ_LENS: {forward_batch.seq_lens.tolist()}", flush=True)
+        print(f"ALEXANDER SEQ_LENS_SUM: {forward_batch.seq_lens_sum}", flush=True)
+        print(f"ALEXANDER REQ_POOL_INDICES: {forward_batch.req_pool_indices.tolist()}", flush=True)
+        
+        # Show KV cache structure analysis
+        page_size = forward_batch.token_to_kv_pool.page_size
+        k_cache, v_cache = my_kv
+        total_tokens_in_cache = k_cache.shape[0]
+        total_pages = total_tokens_in_cache // page_size if page_size > 0 else 0
+        print(f"ALEXANDER TOTAL_TOKENS_IN_CACHE: {total_tokens_in_cache}", flush=True)
+        print(f"ALEXANDER TOTAL_PAGES: {total_pages}", flush=True)
+        print(f"ALEXANDER TOKENS_PER_PAGE: {page_size}", flush=True)
+        
+        # Show decode wrapper configuration
+        print(f"ALEXANDER USE_TENSOR_CORES: {decode_wrapper.use_tensor_cores}", flush=True)
+        print(f"ALEXANDER CUDA_GRAPH_ENABLED: {decode_wrapper.is_cuda_graph_enabled}", flush=True)
+        
+        # If we have kv_indptr, analyze the paging structure
+        if hasattr(decode_wrapper, '_paged_kv_indptr_buf') and decode_wrapper._paged_kv_indptr_buf is not None:
+            kv_indptr = decode_wrapper._paged_kv_indptr_buf
+            batch_size = my_q.shape[0]
+            for i in range(batch_size):
+                if i + 1 < len(kv_indptr):
+                    start_idx = kv_indptr[i].item()
+                    end_idx = kv_indptr[i + 1].item()
+                    num_tokens_for_seq = end_idx - start_idx
+                    num_pages_for_seq = (num_tokens_for_seq + page_size - 1) // page_size if page_size > 0 else 0
+                    print(f"ALEXANDER SEQ_{i}: tokens={num_tokens_for_seq}, pages={num_pages_for_seq}, indptr_range=[{start_idx}:{end_idx}]", flush=True)
+        
+        print("="*50 + " KERNEL CALL START " + "="*50, flush=True)
 
         # Call the wrapped function
         o = decode_wrapper.forward(
@@ -552,6 +632,11 @@ class FlashInferAttnBackend(AttentionBackend):
             k_scale=layer.k_scale,
             v_scale=layer.v_scale,
         )
+
+        print("="*50 + " KERNEL CALL END " + "="*50, flush=True)
+        print(f"ALEXANDER OUTPUT_SHAPE: {o.shape}", flush=True)
+        print(f"ALEXANDER OUTPUT_DTYPE: {o.dtype}", flush=True)
+        print("="*100, flush=True)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
