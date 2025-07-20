@@ -1,6 +1,6 @@
 """
 Usage:
-python3 offline_batch_inference.py  --model meta-llama/Llama-3.1-8B-Instruct
+python3 kernel_extract.py --model meta-llama/Llama-3.1-8B-Instruct --disable-cuda-graph
 """
 
 import argparse
