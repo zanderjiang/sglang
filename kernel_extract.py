@@ -27,7 +27,7 @@ def main(
         # "Hello, my name is Charlie"
     ]
     # Create a sampling params object.
-    sampling_params = {"temperature": 0.8, "top_p": 0.95, "max_new_tokens": 2}
+    sampling_params = {"temperature": 0.8, "top_p": 0.95, "max_new_tokens": 50}
 
     # Create an LLM.
     llm = sgl.Engine(**dataclasses.asdict(server_args))
