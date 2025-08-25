@@ -33,6 +33,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2
+from sglang.kernel_logger import KernelCallLogger_RecordTensor
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -77,6 +78,16 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
+
+        # Initialize kernel logger for MLA decode tracing
+        try:
+            self.kernel_logger = KernelCallLogger_RecordTensor(
+                name="batch_mla_paged_attention",
+                type="mla"
+            )
+        except Exception as e:
+            print(f"Warning: Could not initialize kernel logger: {e}")
+            self.kernel_logger = None
 
         # Allocate buffers
         global global_workspace_buffer
@@ -145,6 +156,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
+
+    def __del__(self):
+        """Ensure workload data is saved when the backend is destroyed."""
+        if hasattr(self, 'kernel_logger') and self.kernel_logger is not None:
+            try:
+                self.kernel_logger.save()
+            except Exception as e:
+                print(f"Warning: Failed to save kernel logger data during cleanup: {e}")
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -380,7 +399,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap
         prefill_wrapper_paged = self.forward_metadata.prefill_wrapper
@@ -487,6 +505,62 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
 
         o = q_nope.new_empty(q_nope.shape)
+        
+        # Print MLA kernel parameters
+        #print(f"!!!!!! MLA DECODE PARAMS: num_heads={layer.tp_q_head_num}, head_dim_ckv={layer.v_head_dim}, head_dim_kpe={layer.head_dim - layer.v_head_dim}, page_size={forward_batch.token_to_kv_pool.page_size} !!!!!!")
+        
+        # Log kernel call parameters for tracing
+        if self.kernel_logger:
+            try:
+                batch_size = q_nope.shape[0]
+                
+                # Get indices from decode wrapper if available
+                kv_indptr = getattr(decode_wrapper, '_kv_indptr', None)
+                qo_indptr = getattr(decode_wrapper, '_qo_indptr', None) 
+                kv_indices = getattr(decode_wrapper, '_kv_indices', None)
+                kv_len_arr = getattr(decode_wrapper, '_kv_len_arr', None)
+                
+                # Calculate num_indptr from batch_size (constraint: num_indptr == batch_size + 1)
+                num_indptr = batch_size + 1
+                # Use max value in kv_indices if available, otherwise fall back to seq_lens_sum
+                if kv_indices is not None and kv_indices.numel() > 0:
+                    num_pages = kv_indices.max().item() + 1  # +1 because indices are 0-based
+                else:
+                    num_pages = forward_batch.seq_lens_sum  # Total number of pages/tokens
+                
+                # Only include variable axes (exclude constants like num_attention_heads, head_dim_ckv, etc.)
+                axes = {
+                    "batch_size": batch_size,
+                    "num_pages": num_pages,
+                    "num_indptr": num_indptr
+                }
+                
+                # Get k_buffer and split it correctly
+                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+                head_dim_ckv = layer.v_head_dim
+                
+                inputs = {
+                    "q_nope": q_nope,
+                    "q_pe": q_rope,
+                    "ckv_cache": k_buffer[:, :, :head_dim_ckv],
+                    "kpe_cache": k_buffer[:, :, head_dim_ckv:],
+                    "sm_scale": torch.tensor(layer.scaling, dtype=torch.float32, device=q_nope.device)
+                }
+                
+                # Add tensor inputs if available
+                if qo_indptr is not None:
+                    inputs["qo_indptr"] = qo_indptr
+                if kv_indptr is not None:
+                    inputs["kv_indptr"] = kv_indptr
+                if kv_indices is not None:
+                    inputs["kv_indices"] = kv_indices
+                if kv_len_arr is not None:
+                    inputs["kv_len_arr"] = kv_len_arr
+                
+                self.kernel_logger.log_call(inputs, axes)
+            except Exception as e:
+                print(f"Warning: Failed to log MLA decode call: {e}")
+        
         # Direct call to run without the wrapper
         o = decode_wrapper.run(
             q_nope,
@@ -591,6 +665,12 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.data_type,
                 self.data_type,
             )
+            
+            # Store indices in wrapper for potential logging
+            wrapper._qo_indptr = q_indptr
+            wrapper._kv_indptr = kv_indptr  
+            wrapper._kv_indices = kv_indices
+            wrapper._kv_len_arr = kv_lens
         else:
             wrapper.plan(
                 fast_decode_kwargs["qo_indptr_cpu"],
@@ -606,6 +686,12 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.data_type,
                 self.data_type,
             )
+            
+            # Store indices in wrapper for potential logging
+            wrapper._qo_indptr = fast_decode_kwargs["qo_indptr_cpu"]
+            wrapper._kv_indptr = fast_decode_kwargs["kv_indptr_cpu"]
+            wrapper._kv_indices = kv_indices
+            wrapper._kv_len_arr = fast_decode_kwargs["kv_len_arr_cpu"]
 
 
 class FlashInferMLAIndicesUpdaterPrefill:
