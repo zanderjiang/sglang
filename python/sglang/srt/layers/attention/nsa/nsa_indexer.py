@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
+import uuid
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -11,6 +15,266 @@ from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+
+# =============================================================================
+# Direct Workload Tracer for DSA TopK Indexer
+# =============================================================================
+
+class DSAIndexerTracer:
+    """
+    - Normal (non-graph): snapshot immediately (detach->cpu) and write.
+    - CUDA graph capture: DO NOT copy. Only register device tensors + axes/def.
+    - CUDA graph replay: call snapshot_cuda_graph_step() AFTER graph.replay().
+
+    IMPORTANT: Multiple CUDA graphs are captured for different batch sizes (1, 2, 4, 8, ...).
+    Each graph has its own input buffers. We store registered tensors per padded batch size.
+    """
+
+    _instance: Optional["DSAIndexerTracer"] = None
+
+    def __init__(self, dataset_path: str):
+        self.dataset_path = Path(dataset_path)
+        self.enabled = True
+        self._lock = __import__("threading").Lock()
+
+        # Pinned buffers + shape capacities (fixes numel-only bug)
+        self._pinned_seq_lens: Optional[torch.Tensor] = None
+        self._pinned_block_table: Optional[torch.Tensor] = None
+        self._cap_seq: Tuple[int, ...] = tuple()
+        self._cap_bt: Tuple[int, int] = (0, 0)
+
+        # CUDA-graph registration PER padded batch size
+        # Key: padded_batch_size (the CUDA graph's batch size)
+        # Value: dict with def_name, axes, seq_lens_dev, block_table_dev
+        self._graph_registrations: Dict[int, Dict[str, Any]] = {}
+
+        print(f"[DSAIndexerTracer] Initialized with dataset: {self.dataset_path}")
+
+    @classmethod
+    def get_instance(cls) -> Optional["DSAIndexerTracer"]:
+        if cls._instance is None:
+            dataset_path = os.environ.get("DSA_TRACE_PATH")
+            if dataset_path:
+                cls._instance = cls(dataset_path)
+        return cls._instance
+
+    @classmethod
+    def init(cls, dataset_path: str) -> "DSAIndexerTracer":
+        cls._instance = cls(dataset_path)
+        return cls._instance
+
+    def _get_def_name(self, num_heads: int, head_dim: int, topk: int, page_size: int) -> str:
+        return f"dsa_topk_indexer_fp8_h{num_heads}_d{head_dim}_topk{topk}_ps{page_size}"
+
+    def _ensure_pinned_seq(self, seq_lens: torch.Tensor):
+        # Shape-aware capacity check (not just numel)
+        need = tuple(seq_lens.shape)
+        if self._pinned_seq_lens is None or len(self._cap_seq) != len(need) or any(c < n for c, n in zip(self._cap_seq, need)):
+            self._pinned_seq_lens = torch.empty(need, dtype=seq_lens.dtype, device="cpu", pin_memory=True)
+            self._cap_seq = need
+
+    def _ensure_pinned_bt(self, block_table: torch.Tensor):
+        need0, need1 = block_table.shape[0], block_table.shape[1]
+        cap0, cap1 = self._cap_bt
+        if self._pinned_block_table is None or cap0 < need0 or cap1 < need1:
+            # grow capacities (optionally round up)
+            new0 = max(cap0, need0)
+            new1 = max(cap1, need1)
+            self._pinned_block_table = torch.empty((new0, new1), dtype=block_table.dtype, device="cpu", pin_memory=True)
+            self._cap_bt = (new0, new1)
+
+    def trace_or_register(
+        self,
+        q_fp8: torch.Tensor,
+        kv_cache_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        topk: int,
+        is_cuda_graph_capture: bool,
+    ):
+        """
+        Call from the op site:
+          - if not capture: snapshot immediately
+          - if capture: register the dev tensors and metadata for later snapshots
+        """
+        if not self.enabled:
+            return
+
+        batch_size = q_fp8.shape[0]
+        num_heads = q_fp8.shape[1] if q_fp8.dim() == 3 else q_fp8.shape[2]
+        head_dim = q_fp8.shape[2] if q_fp8.dim() == 3 else q_fp8.shape[3]
+        num_pages = kv_cache_fp8.shape[0]
+        page_size = kv_cache_fp8.shape[1]
+        max_num_pages = block_table.shape[1]
+
+        def_name = self._get_def_name(num_heads, head_dim, topk, page_size)
+
+        axes = {
+            "batch_size": batch_size,
+            "num_index_heads": num_heads,
+            "index_head_dim": head_dim,
+            "page_size": page_size,
+            "topk": topk,
+            "max_num_pages": max_num_pages,
+            "num_pages": num_pages,
+            "kv_cache_num_heads": 1,
+            "head_dim_with_scale": 132,
+        }
+
+        if is_cuda_graph_capture:
+            # IMPORTANT: no copies / no sync here.
+            # Register per padded batch size (CUDA graph key).
+            # The batch_size in axes is the padded batch size during capture.
+            padded_bs = batch_size
+            with self._lock:
+                self._graph_registrations[padded_bs] = {
+                    "def_name": def_name,
+                    "axes": axes,
+                    "seq_lens_dev": seq_lens,
+                    "block_table_dev": block_table,
+                }
+            return
+
+        # Non-graph: just snapshot now
+        entry = {
+            "def_name": def_name,
+            "uuid": str(uuid.uuid4()),
+            "axes": axes,
+            "seq_lens": seq_lens.detach().cpu(),
+            "block_table": block_table.detach().cpu(),
+        }
+        self._write_entry(entry)
+
+    def snapshot_cuda_graph_step(self, padded_batch_size: int, actual_batch_size: int):
+        """
+        Call AFTER each cudaGraph replay (outside capture).
+        Takes a snapshot of the registered seq_lens/block_table device tensors.
+
+        Args:
+            padded_batch_size: The padded batch size (CUDA graph key) used to look up
+                               the registered tensors from capture.
+            actual_batch_size: The actual (unpadded) batch size to slice the tensors.
+        """
+        if not self.enabled:
+            return
+
+        # Look up registration by padded batch size
+        with self._lock:
+            reg = self._graph_registrations.get(padded_batch_size)
+            if reg is None:
+                return
+            def_name = reg["def_name"]
+            axes = reg["axes"]
+            seq_lens_dev = reg["seq_lens_dev"]
+            block_table_dev = reg["block_table_dev"]
+
+        if def_name is None or axes is None or seq_lens_dev is None or block_table_dev is None:
+            return
+
+        # Skip if actual_batch_size is 0 (empty batch)
+        if actual_batch_size <= 0:
+            return
+
+        # Slice to actual batch size (important: CUDA graph pads to padded_batch_size)
+        seq_lens_actual = seq_lens_dev[:actual_batch_size]
+        block_table_actual = block_table_dev[:actual_batch_size]
+
+        # Pinned D2H snapshot (safe outside capture)
+        self._ensure_pinned_seq(seq_lens_actual)
+        self._ensure_pinned_bt(block_table_actual)
+
+        assert self._pinned_seq_lens is not None
+        assert self._pinned_block_table is not None
+
+        # async copies into pinned buffers
+        self._pinned_seq_lens[:actual_batch_size].copy_(seq_lens_actual, non_blocking=True)
+        self._pinned_block_table[:actual_batch_size, :block_table_actual.shape[1]].copy_(
+            block_table_actual, non_blocking=True
+        )
+
+        # Ensure copy done before we clone/write
+        torch.cuda.synchronize()
+
+        seq_lens_cpu = self._pinned_seq_lens[:actual_batch_size].clone()
+        block_table_cpu = self._pinned_block_table[:actual_batch_size, :block_table_actual.shape[1]].clone()
+
+        # Update axes with actual batch size (capture-time axes have padded batch_size)
+        actual_axes = axes.copy()
+        actual_axes["batch_size"] = actual_batch_size
+        actual_axes["max_num_pages"] = block_table_actual.shape[1]
+
+        entry = {
+            "def_name": def_name,
+            "uuid": str(uuid.uuid4()),
+            "axes": actual_axes,
+            "seq_lens": seq_lens_cpu,
+            "block_table": block_table_cpu,
+        }
+        self._write_entry(entry)
+
+    def _write_entry(self, entry: Dict):
+        def_name = entry["def_name"]
+        workload_uuid = entry["uuid"]
+        all_axes = entry["axes"]
+        seq_lens = entry["seq_lens"]
+        block_table = entry["block_table"]
+
+        # Only include variable axes in definition order
+        # Const axes: num_index_heads, index_head_dim, page_size, topk, kv_cache_num_heads, head_dim_with_scale
+        # Variable axes: batch_size, max_num_pages, num_pages
+        variable_axes = {
+            "batch_size": all_axes["batch_size"],
+            "max_num_pages": all_axes["max_num_pages"],
+            "num_pages": all_axes["num_pages"],
+        }
+
+        op_type = "dsa_paged"
+        blob_dir = self.dataset_path / "blob" / "workloads" / op_type / def_name
+        blob_dir.mkdir(parents=True, exist_ok=True)
+
+        workloads_dir = self.dataset_path / "workloads" / op_type
+        workloads_dir.mkdir(parents=True, exist_ok=True)
+
+        blob_filename = f"{def_name}_{workload_uuid}.safetensors"
+        blob_path = blob_dir / blob_filename
+        relative_blob_path = f"blob/workloads/{op_type}/{def_name}/{blob_filename}"
+
+        try:
+            import safetensors.torch
+            safetensors.torch.save_file({"seq_lens": seq_lens, "block_table": block_table}, blob_path)
+        except Exception as e:
+            print(f"[DSAIndexerTracer] Failed to save tensors: {e}")
+            return
+
+        # Inputs in definition order: q_index_fp8, k_index_cache_fp8, weights, seq_lens, block_table
+        workload_json = {
+            "definition": def_name,
+            "solution": None,
+            "workload": {
+                "uuid": workload_uuid,
+                "axes": variable_axes,
+                "inputs": {
+                    "q_index_fp8": {"type": "random"},
+                    "k_index_cache_fp8": {"type": "random"},
+                    "weights": {"type": "random"},
+                    "seq_lens": {"type": "safetensors", "path": relative_blob_path, "tensor_key": "seq_lens"},
+                    "block_table": {"type": "safetensors", "path": relative_blob_path, "tensor_key": "block_table"},
+                },
+            },
+            "evaluation": None,
+        }
+
+        jsonl_path = workloads_dir / f"{def_name}.jsonl"
+        with self._lock:
+            with open(jsonl_path, "a") as f:
+                f.write(json.dumps(workload_json) + "\n")
+
+
+def get_dsa_tracer() -> Optional[DSAIndexerTracer]:
+    """Helper function to get the DSA tracer instance."""
+    return DSAIndexerTracer.get_instance()
+
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -389,6 +653,21 @@ class Indexer(MultiPlatformOp):
             )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+
+        # Direct workload tracing for DSA TopK Indexer
+        # Trace on layer 0 only to avoid duplicates across layers
+        tracer = get_dsa_tracer()
+        if tracer is not None and layer_id == 0:
+            is_cuda_graph_capture = get_is_capture_mode()
+            tracer.trace_or_register(
+                q_fp8=q_fp8,
+                kv_cache_fp8=kv_cache_fp8,
+                weights=weights,
+                seq_lens=seqlens_32,
+                block_table=block_tables,
+                topk=self.index_topk,
+                is_cuda_graph_capture=is_cuda_graph_capture,
+            )
 
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits

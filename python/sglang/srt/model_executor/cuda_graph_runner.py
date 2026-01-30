@@ -860,6 +860,18 @@ class CudaGraphRunner:
         else:
             graph_key = self.bs
         self.graphs[graph_key].replay()
+
+        # Snapshot DSA tracer after CUDA graph replay (outside capture)
+        # Pass both padded_batch_size (graph key) and actual_batch_size (real batch size)
+        # Lazy import to avoid circular dependency
+        from sglang.srt.layers.attention.nsa.nsa_indexer import get_dsa_tracer
+        dsa_tracer = get_dsa_tracer()
+        if dsa_tracer is not None:
+            dsa_tracer.snapshot_cuda_graph_step(
+                padded_batch_size=self.bs,
+                actual_batch_size=self.raw_bs,
+            )
+
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
